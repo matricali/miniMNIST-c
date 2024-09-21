@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
 
 #define INPUT_SIZE 784
 #define HIDDEN_SIZE 256
@@ -11,6 +12,7 @@
 #define BATCH_SIZE 64
 #define IMAGE_SIZE 28
 #define TRAIN_SPLIT 0.8
+#define NUM_THREADS 8
 
 #define TRAIN_IMG_PATH "data/train-images.idx3-ubyte"
 #define TRAIN_LBL_PATH "data/train-labels.idx1-ubyte"
@@ -28,6 +30,17 @@ typedef struct {
     unsigned char *images, *labels;
     int nImages;
 } InputData;
+
+typedef struct {
+    Network *net;
+    InputData *data;
+    int start_idx, end_idx;
+    float learning_rate;
+    float *total_loss;
+    int *correct_preds;
+    pthread_mutex_t *loss_mutex;
+    pthread_mutex_t *preds_mutex;
+} ThreadData;
 
 void softmax(float *input, int size) {
     float max = input[0], sum = 0;
@@ -75,7 +88,7 @@ void backward(Layer *layer, float *input, float *output_grad, float *input_grad,
     }
 }
 
-void train(Network *net, float *input, int label, float lr) {
+void train(Network *net, float *input, int label, float lr, float *loss, int *correct) {
     float hidden_output[HIDDEN_SIZE], final_output[OUTPUT_SIZE];
     float output_grad[OUTPUT_SIZE] = {0}, hidden_grad[HIDDEN_SIZE] = {0};
 
@@ -85,6 +98,17 @@ void train(Network *net, float *input, int label, float lr) {
 
     forward(&net->output, hidden_output, final_output);
     softmax(final_output, OUTPUT_SIZE);
+
+    // Calculation of loss and accuracy
+    *loss += -logf(final_output[label]);
+    int predicted_label = 0;
+    for (int i = 1; i < OUTPUT_SIZE; i++) {
+        if (final_output[i] > final_output[predicted_label])
+            predicted_label = i;
+    }
+    if (predicted_label == label) {
+        (*correct)++;
+    }
 
     for (int i = 0; i < OUTPUT_SIZE; i++)
         output_grad[i] = final_output[i] - (i == label);
@@ -113,6 +137,29 @@ int predict(Network *net, float *input) {
             max_index = i;
 
     return max_index;
+}
+
+void *train_batch(void *arg) {
+    ThreadData *td = (ThreadData *)arg;
+    float img[INPUT_SIZE];
+    float batch_loss = 0;
+    int batch_correct = 0;
+
+    for (int i = td->start_idx; i < td->end_idx; i++) {
+        for (int k = 0; k < INPUT_SIZE; k++)
+            img[k] = td->data->images[i * INPUT_SIZE + k] / 255.0f;
+        train(td->net, img, td->data->labels[i], td->learning_rate, &batch_loss, &batch_correct);
+    }
+
+    pthread_mutex_lock(td->loss_mutex);
+    *(td->total_loss) += batch_loss;
+    pthread_mutex_unlock(td->loss_mutex);
+
+    pthread_mutex_lock(td->preds_mutex);
+    *(td->correct_preds) += batch_correct;
+    pthread_mutex_unlock(td->preds_mutex);
+
+    return NULL;
 }
 
 void read_mnist_images(const char *filename, unsigned char **images, int *nImages) {
@@ -166,7 +213,7 @@ void shuffle_data(unsigned char *images, unsigned char *labels, int n) {
 int main() {
     Network net;
     InputData data = {0};
-    float learning_rate = LEARNING_RATE, img[INPUT_SIZE];
+    float learning_rate = LEARNING_RATE;
 
     srand(time(NULL));
 
@@ -181,34 +228,38 @@ int main() {
     int train_size = (int)(data.nImages * TRAIN_SPLIT);
     int test_size = data.nImages - train_size;
 
+    pthread_mutex_t loss_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t preds_mutex = PTHREAD_MUTEX_INITIALIZER;
+
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
         float total_loss = 0;
-        for (int i = 0; i < train_size; i += BATCH_SIZE) {
-            for (int j = 0; j < BATCH_SIZE && i + j < train_size; j++) {
-                int idx = i + j;
-                for (int k = 0; k < INPUT_SIZE; k++)
-                    img[k] = data.images[idx * INPUT_SIZE + k] / 255.0f;
+        int correct_preds = 0;
+        pthread_t threads[NUM_THREADS];
+        ThreadData thread_data[NUM_THREADS];
 
-                train(&net, img, data.labels[idx], learning_rate);
+        int batch_size = train_size / NUM_THREADS;
 
-                float hidden_output[HIDDEN_SIZE], final_output[OUTPUT_SIZE];
-                forward(&net.hidden, img, hidden_output);
-                for (int k = 0; k < HIDDEN_SIZE; k++)
-                    hidden_output[k] = hidden_output[k] > 0 ? hidden_output[k] : 0;  // ReLU
-                forward(&net.output, hidden_output, final_output);
-                softmax(final_output, OUTPUT_SIZE);
+        for (int t = 0; t < NUM_THREADS; t++) {
+            thread_data[t].net = &net;
+            thread_data[t].data = &data;
+            thread_data[t].start_idx = t * batch_size;
+            thread_data[t].end_idx = (t + 1) * batch_size;
+            thread_data[t].learning_rate = learning_rate;
+            thread_data[t].total_loss = &total_loss;
+            thread_data[t].correct_preds = &correct_preds;
+            thread_data[t].loss_mutex = &loss_mutex;
+            thread_data[t].preds_mutex = &preds_mutex;
 
-                total_loss += -logf(final_output[data.labels[idx]] + 1e-10f);
-            }
+            pthread_create(&threads[t], NULL, train_batch, &thread_data[t]);
         }
-        int correct = 0;
-        for (int i = train_size; i < data.nImages; i++) {
-            for (int k = 0; k < INPUT_SIZE; k++)
-                img[k] = data.images[i * INPUT_SIZE + k] / 255.0f;
-            if (predict(&net, img) == data.labels[i])
-                correct++;
+
+        for (int t = 0; t < NUM_THREADS; t++) {
+            pthread_join(threads[t], NULL);
         }
-        printf("Epoch %d, Accuracy: %.2f%%, Avg Loss: %.4f\n", epoch + 1, (float)correct / test_size * 100, total_loss / train_size);
+
+        float accuracy = (float)correct_preds / train_size;
+        float average_loss = total_loss / train_size;
+        printf("Epoch %d/%d, Accuracy: %.2f%%, Loss: %.4f\n", epoch + 1, EPOCHS, accuracy * 100, average_loss);
     }
 
     free(net.hidden.weights);
